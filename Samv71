@@ -257,3 +257,158 @@ int main (void)
 		}
 	}
 }
+
+
+使用UART0的接收超时用于判断外部是否停止发送数据    设置 超时时间
+UART0->TODR =  UartRecvOvtm ;
+UART_Enable_ReceiveTimeOut(UART0);
+
+使用前 ：
+UART0->ISR = 0 ;
+UART0->IER  = UART_IER_RXTOIE | UART_IER_RXBFIE ;
+SetRegBit(UART0->CSR, UART_CSR_RXEN_Msk|UART_CSR_TXEN_Msk)；
+
+
+但在中断中 检测不到 超时中断 ， 接收中断正常
+...    uint32_t res = UART0->ISR ;
+    // clear all interrupt flage but not receive error flage . it will be read when all data received  in dma interrupt.
+    UART0->ISR  = 0xffff ;
+
+    if((res & UART_ISR_RXTO)&&(UART0->IER&UART_IER_RXTOIE))
+        ...
+    if((res & UART_ISR_RXBF) && (UART0->IER&UART_IER_RXBFIE))
+
+        ...
+...
+可以收到 接收成功中断。但无法收到超时中断 （测试时 断开了发送与接收的连接）。
+
+原因是什么 ？  此外 超时的起始计数时间是否是使能 UART_CSR_RXEN 的时间 ， 后面每次收到一帧后清零重新开始？
+
+
+修改  附上 完整的程序：
+初始化， EnablePeriph(Clock_UART0); 为打开串口相关的时钟，相应的 DisablePeriph(Clock_UART0);     为关闭串口相关时钟 减低功耗。
+void InitUart0(void)
+{
+
+    EnablePeriph(Clock_UART0);
+    //  set txd and rxd as gpio output OC mode  .
+    GPIO_EnablePinOpendrain(UART_TX_PORT,UART_RX_PIN|UART_TX_PIN);
+    GPIO_DisablePinPullup(UART_TX_PORT,UART_RX_PIN|UART_TX_PIN);
+    GPIO_SetOutputPin(UART_TX_PORT,UART_RX_PIN|UART_TX_PIN);   
+    GPIO_SetPinMode(UART_RX_PORT,UART_RX_PIN,GPIO_MODE_OUTPUT);
+    GPIO_SetPinMode(UART_TX_PORT,UART_TX_PIN,GPIO_MODE_OUTPUT);   
+
+    #ifndef  Uart_SCH_Define
+       ClrRegBit(UART_TX_PORT->DFS , UART_RX_PIN|UART_TX_PIN);
+    #endif
+    //set default value .
+    UART0->CSR = 0 ;
+    // enable read over time , rxd down edge wakeup(made a interrupt).
+
+    //UART_Enable_NegtiveEdgeWakeup(UART0);
+    //enable DMA send last byte interrupt .
+
+    UART_SetTransferBitOrder(UART0,UART_DATA_BITORDER_LSBFIRST);
+    UART_SetStopBitsLength(UART0,UART_STOPBITS_2);
+    UART_SetDataWidth(UART0,UART_DATAWIDTH_8B);
+    UART_SetParity(UART0,UART_PARITY_NONE);
+
+    // set default value :
+    UART0->IER = 0 ;
+    // only enable the wakeup. for receive mode start .
+    //UART_EnableIT_NegtiveEdgeWakeup(UART0);
+    // clear interrupt flage.
+    UART0->ISR = 0 ;
+    // set send dealy and recv overtime .
+    UART0->TODR =  UartRecvOvtm ;
+    UART_Enable_ReceiveTimeOut(UART0);
+    // for safe we used 9600 .
+    UART0->BGR = UART0_Baud ;
+    // enable ir .
+    //UART_COMMON->IRCR = (IRTH<<11) | IRBRG ;
+    //UART_Enable_InfraredModulation(UART0);
+    NVIC_DisableIRQ(UART0_IRQn);
+    NVIC_SetPriority(UART0_IRQn,2);//中断优先级配置
+    NVIC_EnableIRQ(UART0_IRQn);     //使能NVIC   
+    DisablePeriph(Clock_UART0);   
+}
+
+
+// 发送数据 并检测接收
+// do fix data send . it enable recv , and send data sout
+void Uart0DoIr(void)
+{
+    uint8_t  temp = 255;
+    // enable the 3.3V  out .
+    EnPowerOut();
+    // delay a short time for the ir receiver to power up .
+    while(temp >0)
+    {
+        __NOP();
+        __NOP();
+        __NOP();   
+        temp -- ;
+    }
+    GPIO_DisablePinOpendrain(UART_TX_PORT,UART_RX_PIN|UART_TX_PIN);
+    GPIO_SetPinMode(UART_RX_PORT,UART_RX_PIN,GPIO_MODE_DIGITAL);
+    GPIO_SetPinMode(UART_TX_PORT,UART_TX_PIN,GPIO_MODE_DIGITAL);
+    GPIO_EnablePinPullup(UART_TX_PORT,UART_RX_PIN);
+    EnablePeriph(Clock_UART0);
+    // enbale ir clock
+    RCC->PCLKCR3 |= 1<<14 ;
+    // send one byte ,try to receive it .
+    UART0->TXBUF =CmdHeader;
+    UART0->ISR = 0 ;
+    UART0->IER  = UART_IER_RXTOIE | UART_IER_RXBFIE ;
+    UART_Enable_ReceiveTimeOut(UART0);
+    SetRegBit(UART0->CSR, UART_CSR_RXEN_Msk|UART_CSR_TXEN_Msk|UART_CSR_RXTOEN_Msk);
+}
+// 关闭串口 降低功耗
+void Uart0Stop(void)
+{
+    UART0->IER = 0 ;
+    ClrRegBit(UART0->CSR, UART_CSR_RXEN_Msk|UART_CSR_TXEN_Msk);
+    // enbale ir clock
+    RCC->PCLKCR3 &= (~(1<<14)) ;   
+    StopPeriph(Clock_UART0);      
+    GPIO_EnablePinOpendrain(UART_TX_PORT,UART_RX_PIN|UART_TX_PIN);
+    GPIO_DisablePinPullup(UART_TX_PORT,UART_RX_PIN|UART_TX_PIN);
+    GPIO_SetOutputPin(UART_TX_PORT,UART_RX_PIN|UART_TX_PIN);   
+    GPIO_SetPinMode(UART_RX_PORT,UART_RX_PIN,GPIO_MODE_OUTPUT);
+    GPIO_SetPinMode(UART_TX_PORT,UART_TX_PIN,GPIO_MODE_OUTPUT);  
+}
+
+//中断程序
+void UART0_IRQHandler(void)
+{
+        StdEvt evt;
+    uint32_t res = UART0->ISR ;
+    // clear all interrupt flage but not receive error flage . it will be read when all data received  in dma interrupt.
+    UART0->ISR  = 0xffff ;
+
+    if((res & UART_ISR_RXTO)&&(UART0->IER&UART_IER_RXTOIE))
+    { // receive message stoped .
+
+        evt = makeevt(Sig_Ir_OVT,0);
+        postevt((LPThdBlock)&(halmaster.super),evt);   
+        Uart0Stop();      
+        DisPowerOut();   
+    }
+    if((res & UART_ISR_RXBF) && (UART0->IER&UART_IER_RXBFIE))
+    {
+        if(UART0->RXBUF == CmdHeader)
+        {
+            evt = makeevt(Sig_Ir_Recv_Right,0);
+        }
+        else
+        {
+            evt = makeevt(Sig_Ir_Recv_Error,0);
+        }  
+       //    发送相关消息     
+        postevt((LPThdBlock)&(halmaster.super),evt);               
+        Uart0Stop();
+        // 关闭红外接受IC 供电
+        DisPowerOut();        
+    }
+
+}
